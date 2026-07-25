@@ -1,0 +1,20 @@
+# Foundry
+out/
+cache/
+broadcast/
+lib/forge-std/
+lib/openzeppelin-contracts/
+
+# Node
+node_modules/
+dist/
+coverage/
+
+# Env / secrets
+.env
+!.env.example
+
+# Editor
+.vscode/
+.idea/
+.DS_Store
