@@ -7,7 +7,8 @@
   "scripts": {
     "build": "tsc",
     "test": "node --test --import tsx services/test/*.test.ts",
-    "attest": "tsx services/attest.ts"
+    "attest": "tsx services/attest.ts",
+    "demo": "tsx services/demo.ts"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
