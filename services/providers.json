@@ -1,0 +1,10 @@
+{
+  "_comment": "Provider allowlist for the v1 attestation service. v1 assumes providers are pre-vetted off-chain; real medical-licensing verification is a roadmap item per PRD §4.",
+  "providers": {
+    "demo-provider-1": {
+      "address": "0x0000000000000000000000000000000000000001",
+      "category": "telehealth",
+      "jurisdiction": "US-CA"
+    }
+  }
+}

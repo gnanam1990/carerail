@@ -1,0 +1,20 @@
+{
+  "name": "carerail-attestation-service",
+  "version": "0.1.0",
+  "description": "Off-chain attestation service for CareRail providers",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "test": "node --test --import tsx services/test/*.test.ts",
+    "attest": "tsx services/attest.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  },
+  "dependencies": {
+    "ethers": "^6.13.0"
+  }
+}
