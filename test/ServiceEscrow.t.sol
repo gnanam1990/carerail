@@ -61,12 +61,13 @@ contract ServiceEscrowTest is Test {
 
     uint64  public reviewWindow = 7 days;
     uint64  public expiry;
-    uint96  public amount = 40_000_000; // 40.00 USDC (6dp)
+    uint96  public amount = 40_000_000; // 40.00 USDC (6dp) — below ackThreshold
+    uint96  public ackThreshold = 50_000_000; // 50.00 USDC; amount (40) stays under it
 
     function setUp() public {
         usdc       = new MockUSDC();
         arbitrator = makeAddr("arbitrator");
-        escrow     = new ServiceEscrow(usdc, arbitrator);
+        escrow     = new ServiceEscrow(usdc, arbitrator, ackThreshold);
 
         payer    = makeAddr("payer");
         provider = makeAddr("provider");
@@ -381,14 +382,6 @@ contract ServiceEscrowTest is Test {
         escrow.lockFunds(SID, provider, amount, reviewWindow, expiry);
     }
 
-    function test_setProviderAllowed_onlyOwner() public {
-        vm.prank(attacker);
-        vm.expectRevert(ServiceEscrow.NotOwner.selector);
-        escrow.setProviderAllowed(provider, true);
-        escrow.setProviderAllowed(provider, true);
-        assertTrue(escrow.providerAllowed(provider));
-    }
-
     // -----------------------------------------------------------------------
     // Conservation fuzz: every lock ends in exactly one terminal state, funds
     // never stranded. We model a random walk of (attest?, ack/dispute/optimistic
@@ -496,6 +489,157 @@ contract ServiceEscrowTest is Test {
             assertEq(usdc.balanceOf(payer), payerStart, "payer not fully refunded");
             assertEq(usdc.balanceOf(provider), providerStart, "provider should not have been paid");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // ackThreshold — optimistic release gating (the release-model fix)
+    // -----------------------------------------------------------------------
+
+    /// @dev The exact case that had NO coverage before the fix: an above-threshold
+    ///      service where the provider attests and the payer is silent. The provider
+    ///      must NOT be able to release funds by waiting out the window.
+    function test_aboveThreshold_optimisticRelease_reverts() public {
+        uint96 big = 100_000_000; // 100.00 USDC > ackThreshold (50.00)
+        _lock(payer, provider, big, reviewWindow, expiry);
+
+        vm.prank(provider);
+        escrow.submitAttestation(SID, keccak256("record"));
+
+        // Window elapses; payer never acks and never disputes.
+        vm.warp(block.timestamp + reviewWindow + 1);
+
+        // Anyone — including the provider — attempts optimistic release.
+        vm.expectRevert(ServiceEscrow.OptimisticReleaseBlocked.selector);
+        escrow.claimOptimistic(SID);
+
+        // Funds stayed in escrow; provider was not paid; state unchanged.
+        assertEq(usdc.balanceOf(provider), 0, "provider was paid without ack");
+        assertEq(usdc.balanceOf(address(escrow)), big, "escrow lost funds");
+        assertEq(
+            uint256(escrow.getService(SID).state),
+            uint256(ServiceEscrow.State.Attested),
+            "state advanced without ack"
+        );
+    }
+
+    function test_aboveThreshold_payerAck_releases() public {
+        uint96 big = 100_000_000;
+        _lock(payer, provider, big, reviewWindow, expiry);
+        vm.prank(provider);
+        escrow.submitAttestation(SID, keccak256("record"));
+
+        vm.prank(payer);
+        escrow.ack(SID);
+
+        assertEq(usdc.balanceOf(provider), big, "provider not paid on ack");
+        assertEq(uint256(escrow.getService(SID).state), uint256(ServiceEscrow.State.Released));
+    }
+
+    function test_aboveThreshold_disputeThenArbitration_releases() public {
+        uint96 big = 100_000_000;
+        _lock(payer, provider, big, reviewWindow, expiry);
+        vm.prank(provider);
+        escrow.submitAttestation(SID, keccak256("record"));
+        vm.prank(payer);
+        escrow.dispute(SID);
+
+        vm.prank(arbitrator);
+        escrow.resolveDispute(SID, true);
+
+        assertEq(usdc.balanceOf(provider), big, "provider not paid by arbitrator");
+        assertEq(uint256(escrow.getService(SID).state), uint256(ServiceEscrow.State.Released));
+    }
+
+    /// @dev Above-threshold + payer silence past expiry: funds must be recoverable
+    ///      by the payer. Silence must not pay the provider.
+    function test_aboveThreshold_silencePastExpiry_refundsPayer() public {
+        uint96 big = 100_000_000;
+        uint256 payerStart = usdc.balanceOf(payer);
+        _lock(payer, provider, big, reviewWindow, expiry);
+
+        vm.prank(provider);
+        escrow.submitAttestation(SID, keccak256("record"));
+
+        // Payer neither acks nor disputes; window elapses.
+        vm.warp(block.timestamp + reviewWindow + 1);
+        vm.expectRevert(ServiceEscrow.OptimisticReleaseBlocked.selector);
+        escrow.claimOptimistic(SID);
+
+        // Past expiry, anyone may sweep the funds back to the payer.
+        vm.warp(expiry + 1);
+        escrow.refundExpired(SID);
+
+        assertEq(usdc.balanceOf(payer), payerStart, "payer not refunded");
+        assertEq(usdc.balanceOf(provider), 0, "provider paid despite silence");
+        assertEq(uint256(escrow.getService(SID).state), uint256(ServiceEscrow.State.Refunded));
+        assertEq(usdc.balanceOf(address(escrow)), 0, "funds stranded");
+    }
+
+    /// @dev Boundary: amount == ackThreshold keeps the optimistic flow (<= is allowed).
+    function test_atThreshold_optimisticReleaseAllowed() public {
+        uint96 at = ackThreshold; // 50.00 USDC, exactly the threshold
+        _lock(payer, provider, at, reviewWindow, expiry);
+        vm.prank(provider);
+        escrow.submitAttestation(SID, keccak256("record"));
+
+        vm.warp(block.timestamp + reviewWindow + 1);
+        escrow.claimOptimistic(SID);
+
+        assertEq(usdc.balanceOf(provider), at, "boundary not released");
+        assertEq(uint256(escrow.getService(SID).state), uint256(ServiceEscrow.State.Released));
+    }
+
+    /// @dev Sanity: below-threshold behaviour is unchanged (existing tests cover this
+    ///      too, but keep it explicit next to the gating tests).
+    function test_belowThreshold_optimisticReleaseAllowed() public {
+        _lock(payer, provider, amount, reviewWindow, expiry); // 40.00 < 50.00
+        vm.prank(provider);
+        escrow.submitAttestation(SID, keccak256("record"));
+
+        vm.warp(block.timestamp + reviewWindow + 1);
+        escrow.claimOptimistic(SID);
+
+        assertEq(usdc.balanceOf(provider), amount, "below-threshold not released");
+        assertEq(uint256(escrow.getService(SID).state), uint256(ServiceEscrow.State.Released));
+    }
+
+    /// @dev Strict mode (ackThreshold == 0): no service can be optimistically released,
+    ///      because amount must be > 0 to lock, so amount > 0 == amount > threshold.
+    function test_strictMode_blocksAllOptimisticRelease() public {
+        ServiceEscrow strict = new ServiceEscrow(usdc, arbitrator, 0);
+        vm.prank(payer);
+        usdc.approve(address(strict), type(uint256).max);
+        vm.prank(payer);
+        strict.lockFunds(SID, provider, amount, reviewWindow, expiry);
+        vm.prank(provider);
+        strict.submitAttestation(SID, keccak256("record"));
+        vm.warp(block.timestamp + reviewWindow + 1);
+        vm.expectRevert(ServiceEscrow.OptimisticReleaseBlocked.selector);
+        strict.claimOptimistic(SID);
+    }
+
+    // -----------------------------------------------------------------------
+    // MIN_REVIEW_WINDOW floor
+    // -----------------------------------------------------------------------
+
+    function test_reviewWindowBelowMin_reverts() public {
+        // Read the constant BEFORE prank/expectRevert so those cheatcodes are
+        // consumed by lockFunds, not by the view getter.
+        uint64 minWin = uint64(escrow.MIN_REVIEW_WINDOW());
+        vm.prank(payer);
+        vm.expectRevert(ServiceEscrow.ReviewWindowTooShort.selector);
+        escrow.lockFunds(SID, provider, amount, minWin - 1, expiry);
+    }
+
+    function test_reviewWindowAtMin_succeeds() public {
+        bytes32 sid = keccak256("min-window-svc");
+        uint64 minWin = uint64(escrow.MIN_REVIEW_WINDOW());
+        vm.prank(payer);
+        escrow.lockFunds(sid, provider, amount, minWin, expiry);
+        assertEq(
+            uint256(escrow.getService(sid).state),
+            uint256(ServiceEscrow.State.Locked)
+        );
     }
 
     // -----------------------------------------------------------------------

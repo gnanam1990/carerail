@@ -34,6 +34,19 @@ library SafeTransferLib {
 ///      serviceId. Funds release ONLY to that registered provider (or back to
 ///      the original payer on refund) — never to a free-text destination.
 ///
+/// Release model (v2 — threshold-gated optimistic release):
+///   The constructor sets an immutable `ackThreshold` (USDC micro-units). A
+///   service whose locked `amount` is <= ackThreshold keeps the v1 optimistic
+///   flow: after the review window with no dispute, anyone may call
+///   claimOptimistic to release to the provider. A service whose amount is
+///   ABOVE the threshold CANNOT be released optimistically — the provider's
+///   self-attestation alone is insufficient for a high-value claim. Such a
+///   service reaches `Released` only via payer `ack` or arbitrator
+///   `resolveDispute(release=true)` after a payer `dispute`. If the payer
+///   neither acks nor disputes, the funds remain locked until `expiry`, after
+///   which `refundExpired` returns them to the payer — the patient's silence
+///   never pays the provider above the threshold.
+///
 /// State machine (per serviceId):
 ///
 ///   None ──lockFunds──▶ Locked
@@ -42,24 +55,62 @@ library SafeTransferLib {
 ///   Attested ──dispute──▶ Held                        (payer-only, within window)
 ///   Held ──resolveDispute(release=true)──▶ Released   (arbitrator)
 ///   Held ──resolveDispute(release=false)──▶ Refunded  (arbitrator)
-///   Attested ──claimOptimistic──▶ Released            (anyone, after review window, no dispute)
-///   Locked ──refundExpired──▶ Refunded                (anyone, after expiry, no attestation)
-///   Attested ──refundExpired──▶ Refunded              (last-resort safety, after expiry)
+///   Attested ──claimOptimistic──▶ Released            (anyone, after review
+///                              window, no dispute, AND amount <= ackThreshold)
+///   Locked ──refundExpired──▶ Refunded                (anyone, after expiry)
+///   Attested ──refundExpired──▶ Refunded              (anyone, after expiry;
+///                              for above-threshold services this is the
+///                              patient-silence path — payer recovers funds)
+///
+/// Risk allocation (above threshold): the contract protects the PATIENT and
+/// does NOT protect the provider. On payer silence, refundExpired returns the
+/// full amount to the payer — the payer keeps both any care already delivered
+/// and the funds; the patient has no skin in the game in the silent case.
+/// `dispute` is payer-only, so a provider who delivered care to a silent payer
+/// has NO on-chain recourse in this version: they cannot force release or
+/// force arbitration. Providers must require `ack` before delivering
+/// high-value care, or rely on off-chain remedies. (Future item, NOT in v2:
+/// provider-initiated escalation Attested→Held after the window, so an
+/// unacked-but-delivered claim can be adjudicated instead of refunded.)
+///
+/// Threshold-split vector (known, accepted): ackThreshold is checked per
+/// serviceId, so a high-value obligation split into many sub-threshold locks
+/// is fully optimistically releasable. A provider cannot split unilaterally —
+/// lockFunds is payer-initiated (payer picks serviceId + amount, signs the
+/// transferFrom). Residual risk is a payer who doesn't understand the
+/// threshold being talked into splitting. A per-provider rolling-window
+/// aggregate would close it structurally but is a larger change than this
+/// fix warrants; recorded as a future item, not implemented.
+///
+/// Provider allowlist: NOT enforced on-chain. v1 vetting is an off-chain concern
+/// (see services/providers.json + services/attest.ts). The contract's control is
+/// `msg.sender == s.provider` for submitAttestation; the payer chooses the
+/// provider address at lockFunds and bears the vetting responsibility. There is
+/// deliberately no on-chain allowlist mapping: a control that looks live but is
+/// never read is worse than none. See docs/PRD.md §4.
 ///
 /// Invariants encoded as tests in test/ServiceEscrow.t.sol:
 ///   1. Funds release ONLY to the registered provider, or refund ONLY to the
 ///      original payer — never a free-text destination.
 ///   2. A service reaches exactly one terminal state (Released | Refunded).
 ///      No double-release, no double-refund.
-///   3. Optimistic release is reachable only if no dispute was raised in the
-///      review window (window = attestationTime + reviewWindow).
+///   3. Optimistic release is reachable only if (a) no dispute was raised in
+///      the review window AND (b) amount <= ackThreshold. Above-threshold
+///      services can never be optimistically released.
 ///   4. Auto-refund is reachable only if no attestation was submitted before
-///      expiry, OR if an attestation was submitted but the dispute window
-///      closed without resolution (last-resort safety after expiry).
-///   5. Amounts are 6dp USDC; Arc timestamp comparisons are inclusive
-///      (non-decreasing timestamps).
+///      expiry, OR an attestation was submitted but not acked/disputed and
+///      expiry has passed (last-resort safety; for above-threshold services
+///      this is the payer-silence recovery path).
+///   5. Amounts are 6dp USDC; reviewWindow has a floor of MIN_REVIEW_WINDOW;
+///      Arc timestamp comparisons are inclusive (non-decreasing timestamps).
 contract ServiceEscrow {
     using SafeTransferLib for IERC20;
+
+    /// @dev Floor for the payer-set review window. A window shorter than this is
+    ///      not a real defence — the patient would have no time to notice the
+    ///      attestation and act — so lockFunds refuses it. 3 days balances a
+    ///      genuine dispute opportunity against settlement speed for micro-claims.
+    uint64 public constant MIN_REVIEW_WINDOW = 3 days;
 
     // ---------------------------------------------------------------------
     // Types
@@ -91,18 +142,18 @@ contract ServiceEscrow {
 
     IERC20 public immutable usdc;
     address public immutable arbitrator;
-    address public immutable owner;
+
+    /// @dev Services with amount > ackThreshold cannot be released via
+    ///      claimOptimistic. Set once at construction. 0 disables optimistic
+    ///      release for every service (strict mode).
+    uint96 public immutable ackThreshold;
 
     mapping(bytes32 => Service) public services;
-
-    // Optional convenience: per-provider enable flag (off-chain allowlist source of truth).
-    mapping(address => bool)    public providerAllowed;
 
     // ---------------------------------------------------------------------
     // Events
     // ---------------------------------------------------------------------
 
-    event ProviderAllowlistUpdated(address indexed provider, bool allowed);
     event Locked(
         bytes32 indexed serviceId,
         address indexed payer,
@@ -121,7 +172,6 @@ contract ServiceEscrow {
     // Errors
     // ---------------------------------------------------------------------
 
-    error NotOwner();
     error UnknownService();
     error WrongState();
     error NotPayer();
@@ -132,45 +182,19 @@ contract ServiceEscrow {
     error DisputeWindowClosed();
     error ZeroAmount();
     error ZeroAddress();
-    error InvalidWindow();
     error ExpiryMustBeFuture();
-
-    // ---------------------------------------------------------------------
-    // Modifiers
-    // ---------------------------------------------------------------------
-
-    modifier onlyOwner() {
-        if (msg.sender != owner) revert NotOwner();
-        _;
-    }
-
-    modifier onlyArbitrator() {
-        if (msg.sender != arbitrator) revert NotArbitrator();
-        _;
-    }
+    error ReviewWindowTooShort();
+    error OptimisticReleaseBlocked(); // amount > ackThreshold
 
     // ---------------------------------------------------------------------
     // Construction
     // ---------------------------------------------------------------------
 
-    constructor(IERC20 _usdc, address _arbitrator) {
+    constructor(IERC20 _usdc, address _arbitrator, uint96 _ackThreshold) {
         if (address(_usdc) == address(0) || _arbitrator == address(0)) revert ZeroAddress();
         usdc = _usdc;
         arbitrator = _arbitrator;
-        owner = msg.sender;
-    }
-
-    // ---------------------------------------------------------------------
-    // Admin
-    // ---------------------------------------------------------------------
-
-    /// @notice Toggle a provider on the allowlist. v1: this is a stub mirroring
-    ///         an off-chain pre-vetting flow; real licensing verification is a
-    ///         roadmap item per PRD §4.
-    function setProviderAllowed(address provider, bool allowed) external onlyOwner {
-        if (provider == address(0)) revert ZeroAddress();
-        providerAllowed[provider] = allowed;
-        emit ProviderAllowlistUpdated(provider, allowed);
+        ackThreshold = _ackThreshold; // 0 is allowed => strict mode (no optimistic release)
     }
 
     // ---------------------------------------------------------------------
@@ -193,7 +217,7 @@ contract ServiceEscrow {
         if (provider == address(0)) revert ZeroAddress();
         if (amount == 0) revert ZeroAmount();
         if (expiry <= block.timestamp) revert ExpiryMustBeFuture();
-        if (reviewWindow == 0) revert InvalidWindow();
+        if (reviewWindow < MIN_REVIEW_WINDOW) revert ReviewWindowTooShort();
 
         Service storage s = services[serviceId];
         if (s.state != State.None) revert WrongState();
@@ -211,6 +235,9 @@ contract ServiceEscrow {
     }
 
     /// @notice Provider submits a hash of the visit/procedure record. Never PHI.
+    /// @dev On-chain allowlisting is intentionally NOT enforced here — vetting is
+    ///      off-chain (see docs). The contract gates on msg.sender == s.provider,
+    ///      i.e. the provider address the payer chose at lockFunds.
     function submitAttestation(bytes32 serviceId, bytes32 recordHash) external {
         Service storage s = services[serviceId];
         if (s.state == State.None) revert UnknownService();
@@ -256,11 +283,17 @@ contract ServiceEscrow {
         emit Disputed(serviceId, msg.sender);
     }
 
-    /// @notice Optimistic release — anyone can call after the review window, iff no dispute.
+    /// @notice Optimistic release — anyone can call after the review window, iff
+    ///         no dispute AND the service amount is at or below ackThreshold.
+    ///         Above-threshold services revert: high-value release requires payer
+    ///         ack or arbitrator resolution, never provider self-release.
     function claimOptimistic(bytes32 serviceId) external {
         Service storage s = services[serviceId];
         if (s.state != State.Attested) revert WrongState();
         if (s.attestationTime == 0) revert WrongState();
+
+        // High-value services are exempt from optimistic release by design.
+        if (uint256(s.amount) > uint256(ackThreshold)) revert OptimisticReleaseBlocked();
 
         // Claim is allowed strictly after the dispute window deadline.
         if (block.timestamp <= uint256(s.attestationTime) + uint256(s.reviewWindow)) {
@@ -275,7 +308,8 @@ contract ServiceEscrow {
 
     /// @notice Arbitrator resolves a held dispute. releaseToProvider=true pays the provider,
     ///         false refunds the payer.
-    function resolveDispute(bytes32 serviceId, bool releaseToProvider) external onlyArbitrator {
+    function resolveDispute(bytes32 serviceId, bool releaseToProvider) external {
+        if (msg.sender != arbitrator) revert NotArbitrator();
         Service storage s = services[serviceId];
         if (s.state != State.Held) revert WrongState();
 
@@ -294,9 +328,11 @@ contract ServiceEscrow {
 
     /// @notice Auto-refund to the payer if expiry passed and either:
     ///         (a) no attestation was ever submitted (state == Locked), OR
-    ///         (b) an attestation was submitted but the dispute window has elapsed
-    ///             without an ack/dispute/optimistic claim (state == Attested) — last-resort
-    ///             safety so funds are never permanently stranded.
+    ///         (b) an attestation was submitted but not acked/disputed and expiry
+    ///             has elapsed (state == Attested) — last-resort safety so funds
+    ///             are never permanently stranded. For above-threshold services
+    ///             this is the payer-silence recovery path: if the patient neither
+    ///             acked nor disputed, the patient recovers the funds after expiry.
     function refundExpired(bytes32 serviceId) external {
         Service storage s = services[serviceId];
         if (s.state != State.Locked && s.state != State.Attested) revert WrongState();
