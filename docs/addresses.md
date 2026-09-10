@@ -211,7 +211,10 @@ isn't is worse than none. Real licensing verification is a non-goal for v1; the 
 only provider control is `msg.sender == s.provider`, the address the payer chose.
 
 **Record hashes are synthetic.** The four attestations carry
-`keccak256("synthetic-record-A"…"D")`. They reference nothing. A real deployment would
+`keccak256("synthetic-record-A"…"D")`. They reference nothing and predate the
+canonical convention documented in `services/README.md` (record hashes are
+SHA-256 over the canonical JSON record via `attest.hashRecord`; `serviceId`
+is `keccak256` of the human-readable id). A real deployment would
 hash an actual visit record — but note that the provider would still generate that hash,
 so this changes what is referenced, not who is trusted.
 

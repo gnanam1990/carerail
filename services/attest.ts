@@ -96,13 +96,36 @@ export interface AttestResult {
   blockNumber?: number;
 }
 
+/** Minimal signer surface submitAttestation needs (Wallet satisfies this). */
+export interface SubmitterSigner {
+  getAddress(): Promise<string>;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  connect?: (...args: any[]) => any;
+}
+
+/** Injected chain-call surface for tests. When set, no RPC is touched. */
+export interface SubmitChainDeps {
+  createContract?: (
+    escrowAddress: string,
+    abi: typeof SERVICE_ESCROW_ABI,
+    signerWithProvider: unknown
+  ) => {
+    getService(serviceId: string): Promise<any>;
+    submitAttestation(
+      serviceId: string,
+      recordHash: string
+    ): Promise<{ wait(): Promise<{ hash: string; blockNumber?: number }> }>;
+  };
+}
+
 export async function submitAttestation(
   input: AttestInput,
   opts: {
     rpcUrl: string;
     escrowAddress: string;
-    signer: Wallet;
+    signer: SubmitterSigner;
     allowlist?: ProviderAllowlist;
+    deps?: SubmitChainDeps;
   }
 ): Promise<AttestResult> {
   const { rpcUrl, escrowAddress, signer, allowlist } = opts;
@@ -117,7 +140,13 @@ export async function submitAttestation(
   const serviceId = buildServiceId(input.serviceId);
 
   const provider = new JsonRpcProvider(rpcUrl);
-  const contract = new Contract(escrowAddress, SERVICE_ESCROW_ABI, signer.connect(provider));
+  const contract = opts.deps?.createContract
+    ? opts.deps.createContract(escrowAddress, SERVICE_ESCROW_ABI, signer)
+    : new Contract(
+        escrowAddress,
+        SERVICE_ESCROW_ABI,
+        (signer as Wallet).connect(provider)
+      );
 
   // Sanity: confirm the on-chain service is in Locked and the signer is the
   // registered provider. Fails closed if either is wrong.

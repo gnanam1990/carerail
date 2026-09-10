@@ -15,8 +15,8 @@ import {
   formatUnits,
   parseUnits,
 } from "ethers";
-import { execSync } from "node:child_process";
 import { readFileSync } from "node:fs";
+import { hashRecord } from "./attest.js";
 
 const ARC_RPC   = process.env.ARC_TESTNET_RPC ?? "https://rpc.testnet.arc.network";
 const EXPLORER  = process.env.EXPLORER_BASE   ?? "https://testnet.arcscan.app";
@@ -71,7 +71,10 @@ async function scenario1() {
   const r2 = await tx2.wait();
   console.log(`  lockFunds ${link("tx", tx2.hash)}  block ${r2!.blockNumber}`);
 
-  const tx3 = await escrowProv.submitAttestation(SID_1, keccak256(toUtf8Bytes("synthetic-record")));
+  // Canonical record-hash convention: sha256(JSON) via attest.hashRecord.
+  // The payload stays synthetic (no PHI); only the hash reaches the chain.
+  const recordHash = hashRecord({ synthetic: true, record: "synthetic-record" });
+  const tx3 = await escrowProv.submitAttestation(SID_1, recordHash);
   await tx3.wait();
   console.log(`  attest    ${link("tx", tx3.hash)}`);
 
