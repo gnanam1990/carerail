@@ -24,7 +24,8 @@ npm install
 npm test
 
 # 3. submit a real attestation
-ESCROW_ADDRESS=0x... \
+# Arc testnet: chain 5042002, RPC https://rpc.testnet.arc.network, explorer https://testnet.arcscan.app, escrow 0xfBCCcCE1650824c6F06945DBa5e95c16a6Afe9D8 (see ../docs/addresses.md)
+ESCROW_ADDRESS=0xfBCCcCE1650824c6F06945DBa5e95c16a6Afe9D8 \
 PROVIDER_PRIVATE_KEY=0x... \
 ARC_TESTNET_RPC=https://rpc.testnet.arc.network \
 tsx services/attest.ts "telehealth-consult-001" ./record.json

@@ -23,11 +23,12 @@ cp .env.example .env
 # edit .env: PRIVATE_KEY, PROVIDER_KEY, USDC_ADDRESS, ARBITRATOR
 source .env
 forge script script/Deploy.s.sol:Deploy --rpc-url $ARC_TESTNET_RPC --broadcast
-ESCROW_ADDRESS=0x... forge script script/DemoScenarios.s.sol:DemoScenarios --rpc-url $ARC_TESTNET_RPC --broadcast
+# Arc testnet: chain 5042002, RPC https://rpc.testnet.arc.network, explorer https://testnet.arcscan.app, escrow 0xfBCCcCE1650824c6F06945DBa5e95c16a6Afe9D8 (see docs/addresses.md)
+ESCROW_ADDRESS=0xfBCCcCE1650824c6F06945DBa5e95c16a6Afe9D8 forge script script/DemoScenarios.s.sol:DemoScenarios --rpc-url $ARC_TESTNET_RPC --broadcast
 
 # 4. Run the demo CLI (prints real explorer links)
-ESCROW_ADDRESS=0x... npm run demo -- 1   # scenario 1
-ESCROW_ADDRESS=0x... npm run demo -- 2   # scenario 2
+ESCROW_ADDRESS=0xfBCCcCE1650824c6F06945DBa5e95c16a6Afe9D8 npm run demo -- 1   # scenario 1
+ESCROW_ADDRESS=0xfBCCcCE1650824c6F06945DBa5e95c16a6Afe9D8 npm run demo -- 2   # scenario 2
 ```
 
 ## Layout
